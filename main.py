@@ -5,161 +5,201 @@ import requests
 import time
 import datetime
 import sys
+import re
 from bs4 import BeautifulSoup
 from groq import Groq
 from typing import Dict, Any, Optional, Tuple
 
 # ==============================================================================
-# КОНФИГУРАЦИЯ ЦЕНТРА УПРАВЛЕНИЯ
+# КОНФИГУРАЦИЯ
 # ==============================================================================
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger("Tracen_Global_JP_Intel")
+logger = logging.getLogger("Tracen_Intel_Center")
 
-# Роли для уведомлений
 ROLE_NEWS = "1440444308506280210"
 ROLE_BANNER = "1439787310831894679"
 
-# Конфиги URL (Пример для Глобала — официальный сайт или агрегатор)
 JP_URL = "https://umamusume.jp/news/"
-GLOBAL_URL = "https://uma.kakaogames.com/news/" # Пример для глобал/корейской базы
+# Глобал часто меняет структуру, используем наиболее стабильный путь к анонсам
+GLOBAL_URL = "https://uma.kakaogames.com/news/all" 
 
-# Файлы БД для каждого региона
 DB_JP = "last_id_jp.txt"
 DB_GL = "last_id_gl.txt"
 
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+# Инициализация клиента
+GROQ_KEY = os.environ.get("GROQ_API_KEY")
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK")
 
+if not GROQ_KEY or not WEBHOOK:
+    logger.critical("ОШИБКА: Проверьте секреты GitHub (GROQ_API_KEY и DISCORD_WEBHOOK)!")
+    sys.exit(1)
+
+client = Groq(api_key=GROQ_KEY)
+
 # ==============================================================================
-# МОДУЛЬ ГЛОБАЛЬНОЙ РАЗВЕДКИ
+# МОДУЛЬ СКАНЕРА (УЛУЧШЕННЫЙ)
 # ==============================================================================
 
 class TracenScanner:
-    def __init__(self, region_name: str, base_url: str, db_file: str):
-        self.region = region_name
-        self.url = base_url
-        self.db_file = db_file
-        self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    def __init__(self, region: str, url: str, db: str):
+        self.region = region
+        self.url = url
+        self.db = db
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
 
     def get_latest(self) -> Optional[Dict[str, str]]:
-        """Универсальный парсер для двух регионов"""
         try:
-            r = requests.get(self.url, headers=self.headers, timeout=20)
+            r = requests.get(self.url, headers=self.headers, timeout=25)
+            r.raise_for_status()
             soup = BeautifulSoup(r.text, 'html.parser')
             
-            # Логика парсинга (адаптируется под структуру сайта региона)
-            if "jp" in self.region.lower():
+            if "Japan" in self.region:
+                # Поиск в японской структуре
                 item = soup.select_one('.news-list__item')
-                link = "https://umamusume.jp" + item.find('a')['href']
-                img = item.find('img')['src'] if item.find('img') else None
+                if not item: return None
+                
+                link_tag = item.find('a')
+                if not link_tag: return None
+                
+                link = "https://umamusume.jp" + link_tag['href']
+                img_tag = item.find('img')
+                img = img_tag['src'] if img_tag else None
+                news_id = link.split('=')[-1]
+                
             else:
-                # Пример для глобальной структуры
-                item = soup.select_one('.article_list li') or soup.select_one('.news_item')
-                link = item.find('a')['href']
-                img = None # Глобал часто не дает превью в списке
-            
-            news_id = link.split('=')[-1] or link.split('/')[-1]
-            return {"id": news_id, "url": link, "img": img}
+                # Поиск в глобальной структуре (Kakao)
+                item = soup.select_one('.article_list li') or soup.select_one('tr') or soup.select_one('.news_item')
+                if not item: return None
+                
+                link_tag = item.find('a')
+                if not link_tag: return None
+                
+                link = link_tag['href']
+                if not link.startswith('http'):
+                    link = "https://uma.kakaogames.com" + link
+                
+                img = None # Глобал редко дает превью в списке
+                news_id = link.rstrip('/').split('/')[-1]
+
+            return {"id": str(news_id), "url": link, "img": img}
         except Exception as e:
-            logger.error(f"Ошибка сканирования {self.region}: {e}")
+            logger.error(f"[{self.region}] Ошибка сканирования: {e}")
             return None
 
-    def check_new(self, current_id: str) -> bool:
-        if not os.path.exists(self.db_file): return True
-        with open(self.db_file, 'r') as f:
-            return f.read().strip() != current_id
+    def is_new(self, news_id: str) -> bool:
+        if not os.path.exists(self.db):
+            with open(self.db, 'w') as f: f.write("0")
+            return True
+        with open(self.db, 'r') as f:
+            return f.read().strip() != news_id
 
-    def save_id(self, current_id: str):
-        with open(self.db_file, 'w') as f: f.write(current_id)
+    def save(self, news_id: str):
+        with open(self.db, 'w') as f: f.write(news_id)
 
 # ==============================================================================
-# ИИ-АНАЛИЗАТОР (КРОСС-РЕГИОНАЛЬНЫЙ)
+# ИИ-АНАЛИЗАТОР (УЛЬТРА)
 # ==============================================================================
 
 class MultiRegionAI:
     @staticmethod
-    def analyze(title: str, text: str, region: str) -> Dict[str, Any]:
+    def analyze(raw_html: str, region: str) -> Dict[str, Any]:
+        # Очистка текста от лишних тегов для экономии токенов
+        soup = BeautifulSoup(raw_html, 'html.parser')
+        text = soup.get_text(separator=' ', strip=True)[:5000]
+
         prompt = f"""
-        Ты — главный аналитик Tracen Intelligence. 
-        РЕГИОН: {region}
-        Заголовок: {title}
-        Текст: {text}
-
+        Ты — Главный Аналитик Tracen Academy. Твоя специализация — игра 'Uma Musume: Pretty Derby'.
+        РЕГИОН ДАННЫХ: {region}
+        
         ЗАДАЧА:
-        1. Определи Ранг (S/A/B/C).
-        2. Это баннер или важный слив? (True/False).
-        3. Если это Глобал, вспомни, как это было в Японии (если можешь).
-        4. Сделай подробный разбор на русском.
+        1. Назначь RANK (S/A/B/C) по важности.
+        2. Переведи заголовок на русский.
+        3. Это БАННЕР (гача) или важный СЛИВ? (True/False).
+        4. Сделай детальный разбор (даты, камни, новые персонажи).
+        5. Дай прогноз: что это значит для будущего игры.
 
-        ВЕРНИ JSON:
+        ОТВЕТЬ СТРОГО JSON:
         {{
             "rank": "...", "title": "...", "is_banner": bool,
-            "summary": "...", "details": "...", "future": "...", "verdict": "..."
+            "summary": "Краткая суть", "details": "Детальный список",
+            "future": "Прогноз", "verdict": "Совет тренеру"
         }}
         """
-        res = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            response_format={"type": "json_object"}
-        )
-        return json.loads(res.choices[0].message.content)
+        try:
+            res = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                response_format={"type": "json_object"}
+            )
+            return json.loads(res.choices[0].message.content)
+        except Exception as e:
+            logger.error(f"AI Error: {e}")
+            return {"rank": "B", "title": "Ошибка анализа", "is_banner": False, 
+                    "summary": "Не удалось обработать текст", "details": "N/A", "future": "N/A", "verdict": "N/A"}
 
 # ==============================================================================
-# ФИНАЛЬНАЯ СБОРКА И ОТПРАВКА
+# ЛОГИКА ОБРАБОТКИ
 # ==============================================================================
 
-def process_region(region_name, url, db_file):
-    scanner = TracenScanner(region_name, url, db_file)
+def process_region(name, url, db):
+    scanner = TracenScanner(name, url, db)
     meta = scanner.get_latest()
     
-    if meta and scanner.check_new(meta["id"]):
-        logger.info(f"Найдена новая новость в регионе {region_name}!")
+    if meta and scanner.is_new(meta["id"]):
+        logger.info(f"[{name}] Найдена новая запись: {meta['id']}")
         
-        # Получаем полный текст
-        r = requests.get(meta["url"])
-        soup = BeautifulSoup(r.text, 'html.parser')
-        raw_text = soup.get_text()[:6000] # Ограничение для ИИ
+        # Получение контента статьи
+        try:
+            content_page = requests.get(meta["url"], timeout=20).text
+        except:
+            content_page = "Не удалось загрузить страницу."
+
+        analysis = MultiRegionAI.analyze(content_page, name)
         
-        analysis = MultiRegionAI.analyze(region_name, raw_text, region_name)
-        
-        # Пинги
+        # Пинги и оформление
         ping = f"<@&{ROLE_NEWS}>"
         if analysis.get("is_banner") or analysis.get("rank") == "S":
             ping += f" <@&{ROLE_BANNER}>"
             
         color = {"S": 0xFFD700, "A": 0xFF4500, "B": 0xDA70D6, "C": 0x5DADE2}.get(analysis["rank"], 0x99AAB5)
         
-        payload = {
-            "content": f"📢 **НОВЫЙ ОТЧЕТ: РЕГИОН {region_name.upper()}**\n{ping}",
+        embed_data = {
+            "content": f"📢 **ОПЕРАТИВНЫЙ ОТЧЕТ: {name.upper()}**\n{ping}",
             "embeds": [{
                 "title": f"— ✦ RANK: {analysis['rank']} | {analysis['title']} ✦ —",
                 "description": (
                     f"**{analysis['summary']}**\n\n"
-                    f"╭─── ⭐ **АНАЛИЗ ({region_name})**\n"
+                    f"╭─── ⭐ **АНАЛИЗ ({name})**\n"
                     f"│ {analysis['details']}\n"
                     "│\n"
-                    f"│ ▸ **ПРЕДСКАЗАНИЕ / СЛИВЫ**\n"
+                    f"│ ▸ **ПРОГНОЗЫ И СЛИВЫ**\n"
                     f"│ 🔮 {analysis['future']}\n"
                     "│\n"
-                    f"│ ▸ **ВЕРДИКТ ТРЕНЕРА**\n"
+                    f"│ ▸ **ВЕРДИКТ**\n"
                     f"│ ✅ {analysis['verdict']}\n"
-                    f"╰─── 🔗 [ИСТОЧНИК]({meta['url']})"
+                    f"╰─── 🔗 [ОРИГИНАЛ]({meta['url']})"
                 ),
                 "color": color,
                 "image": {"url": meta["img"]} if meta["img"] else {},
-                "footer": {"text": f"Region: {region_name} | Tracen Intelligence Unit"},
+                "footer": {"text": f"Region: {name} | Tracen Intelligence Unit"},
                 "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
             }]
         }
         
-        requests.post(WEBHOOK, json=payload)
-        scanner.save_id(meta["id"])
+        response = requests.post(WEBHOOK, json=embed_data)
+        if response.status_code < 300:
+            scanner.save(meta["id"])
+            logger.info(f"[{name}] Успешно отправлено.")
 
 def main():
-    # Запуск по очереди для каждого региона
+    # Япония
     process_region("Japan", JP_URL, DB_JP)
+    time.sleep(5) # Задержка между регионами
+    # Глобал
     process_region("Global", GLOBAL_URL, DB_GL)
 
 if __name__ == "__main__":
