@@ -1,0 +1,27 @@
+<!-- end list -->
+name: Uma Divine Tracker
+on:
+  schedule:
+    - cron: '*/10 * * * *' # Проверка каждые 10 минут
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  run_bot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - run: pip install -r requirements.txt
+      - env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: python main.py
+      - run: |
+          git config --global user.name "TracenBot"
+          git config --global user.email "bot@tracen.academy"
+          git add last_id_jp.txt last_id_gl.txt
+          git commit -m "Sync DB" || exit 0
+          git push
