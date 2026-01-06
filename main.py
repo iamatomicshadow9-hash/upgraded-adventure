@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup
 from groq import Groq
 from typing import Dict, Any, Optional, Tuple
 
-# Настройка логирования для GitHub Actions
+# Настройка логирования для GitHub Actions (вывод сразу в консоль)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', stream=sys.stdout)
 logger = logging.getLogger("Tracen_Intelligence")
 
@@ -29,7 +29,7 @@ GROQ_KEY = os.environ.get("GROQ_API_KEY")
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK")
 
 if not GROQ_KEY or not WEBHOOK:
-    print("!!! ОШИБКА: Проверь секреты в GitHub !!!", flush=True)
+    print("!!! ОШИБКА: Проверь секреты GROQ_API_KEY и DISCORD_WEBHOOK в GitHub !!!", flush=True)
     sys.exit(1)
 
 client = Groq(api_key=GROQ_KEY)
@@ -39,7 +39,9 @@ class TracenScanner:
         self.region = region_name
         self.url = base_url
         self.db_file = db_file
-        self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
 
     def get_latest(self) -> Optional[Dict[str, str]]:
         try:
@@ -49,29 +51,54 @@ class TracenScanner:
             soup = BeautifulSoup(r.text, 'html.parser')
             
             if "Japan" in self.region:
+                # МЕХАНИЗМ УСИЛЕННОГО ПОИСКА (JP)
                 item = soup.select_one('.news-list__item')
-                if not item: item = soup.find('a', href=re.compile(r'detail\.php'))
-                if not item: return None
+                if not item:
+                    item = soup.find('a', href=re.compile(r'detail\.php\?id=\d+'))
+                if not item:
+                    item = soup.select_one('li[class*="news"]')
+
+                if not item: 
+                    print(f"DEBUG: На странице JP не найдены новости. Проверь структуру сайта.", flush=True)
+                    return None
+                
                 link_tag = item if item.name == 'a' else item.find('a')
-                link = "https://umamusume.jp" + link_tag['href']
+                if not link_tag: return None
+                
+                href = link_tag['href']
+                link = "https://umamusume.jp" + href if href.startswith('/') else href
+                
+                # Извлекаем чистый цифровой ID
+                news_id_match = re.search(r'id=(\d+)', link)
+                news_id = news_id_match.group(1) if news_id_match else link.split('/')[-1]
+                
                 img_tag = item.find('img') if hasattr(item, 'find') else None
                 img = img_tag['src'] if img_tag else None
-                return {"id": str(link.split('=')[-1]), "url": link, "img": img}
+                
+                return {"id": str(news_id), "url": link, "img": img}
+            
             else:
+                # ПОИСК ДЛЯ GLOBAL (CRUNCHYROLL)
                 links = soup.find_all('a', href=True)
                 for a in links:
-                    if "uma-musume" in a['href'].lower():
+                    href = a['href'].lower()
+                    if "uma-musume" in href or "pretty-derby" in href:
                         l = a['href'] if a['href'].startswith('http') else "https://www.crunchyroll.com" + a['href']
-                        return {"id": str(l.split('/')[-1]), "url": l, "img": None}
+                        id_val = l.rstrip('/').split('/')[-1]
+                        return {"id": str(id_val), "url": l, "img": None}
                 return None
         except Exception as e:
             print(f"Ошибка сканера {self.region}: {e}", flush=True)
             return None
 
     def check_new(self, current_id: str) -> bool:
-        if not os.path.exists(self.db_file): return True
+        if not os.path.exists(self.db_file): 
+            with open(self.db_file, 'w') as f: f.write("EMPTY")
+            return True
         with open(self.db_file, 'r') as f:
-            return f.read().strip() != current_id
+            old_id = f.read().strip()
+            print(f"Сравнение для {self.region}: Старый({old_id}) vs Новый({current_id})", flush=True)
+            return old_id != current_id
 
     def save_id(self, current_id: str):
         with open(self.db_file, 'w') as f: f.write(str(current_id))
@@ -79,20 +106,20 @@ class TracenScanner:
 class MultiRegionAI:
     @staticmethod
     def analyze(text: str, region: str) -> Dict[str, Any]:
-        print(f"--- Запуск ИИ-анализа для {region} ---", flush=True)
+        print(f"--- Отправка в ИИ ({region}) ---", flush=True)
         prompt = f"""
         Ты — главный аналитик Tracen Intelligence. Сделай подробный разбор на русском.
         РЕГИОН: {region}
         ЗАДАЧА:
         1. Определи Ранг (S/A/B/C).
-        2. Это баннер или важный слив? (True/False).
-        3. Сделай разбор.
+        2. Это баннер или важный анонс? (True/False).
+        3. Сделай краткий и емкий разбор.
         ВЕРНИ СТРОГО JSON:
         {{
             "rank": "...", "title": "...", "is_banner": bool,
             "summary": "...", "details": "...", "future": "...", "verdict": "..."
         }}
-        Текст: {text[:5000]}
+        Текст новости: {text[:4500]}
         """
         res = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -106,11 +133,16 @@ def process_region(region_name, url, db_file):
     meta = scanner.get_latest()
     
     if meta and scanner.check_new(meta["id"]):
-        print(f"!!! НАЙДЕНА НОВАЯ НОВОСТЬ [{region_name}] !!!", flush=True)
+        print(f"!!! ОБНАРУЖЕНА НОВАЯ АКТИВНОСТЬ: [{region_name}] ID {meta['id']} !!!", flush=True)
         try:
-            raw_text = requests.get(meta["url"], timeout=20).text
-            analysis = MultiRegionAI.analyze(raw_text, region_name)
+            # Очистка текста от HTML тегов для ИИ
+            resp = requests.get(meta["url"], timeout=20)
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            clean_text = soup.get_text(separator=' ', strip=True)
             
+            analysis = MultiRegionAI.analyze(clean_text, region_name)
+            
+            # Пинги
             ping = f"<@&{ROLE_NEWS}>"
             if analysis.get("is_banner") or analysis.get("rank") == "S":
                 ping += f" <@&{ROLE_BANNER}>"
@@ -135,22 +167,28 @@ def process_region(region_name, url, db_file):
                     ),
                     "color": color,
                     "image": {"url": meta["img"]} if meta["img"] else {},
-                    "footer": {"text": f"Region: {region_name} | Tracen Intelligence Unit"},
+                    "footer": {"text": f"Unit: Tracen Intel • Region: {region_name} • ID: {meta['id']}"},
                     "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
                 }]
             }
             
-            if requests.post(WEBHOOK, json=payload).status_code < 300:
+            r = requests.post(WEBHOOK, json=payload)
+            if r.status_code < 300:
                 scanner.save_id(meta["id"])
-                print("Успешно отправлено.", flush=True)
+                print(f"Отчет {region_name} успешно доставлен в Discord.", flush=True)
+            else:
+                print(f"Ошибка Discord Webhook: {r.status_code}", flush=True)
         except Exception as e:
-            print(f"Ошибка: {e}", flush=True)
+            print(f"Ошибка обработки {region_name}: {e}", flush=True)
     else:
-        print(f"Новостей для {region_name} нет.", flush=True)
+        print(f"Обновлений для {region_name} не найдено.", flush=True)
 
 if __name__ == "__main__":
-    print("=== STARTING TRACEN BOT ===", flush=True)
+    print("=== ЗАПУСК TRACEN INTELLIGENCE SYSTEM ===", flush=True)
+    # Обработка Японии
     process_region("Japan", JP_URL, DB_JP)
-    time.sleep(5)
+    print("--- Ожидание перед сменой региона... ---", flush=True)
+    time.sleep(7)
+    # Обработка Глобала
     process_region("Global", GLOBAL_URL, DB_GL)
-    print("=== WORK FINISHED ===", flush=True)
+    print("=== ЦИКЛ МОНИТОРИНГА ЗАВЕРШЕН ===", flush=True)
