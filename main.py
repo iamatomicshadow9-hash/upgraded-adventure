@@ -29,7 +29,7 @@ GROQ_KEY = os.environ.get("GROQ_API_KEY")
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK")
 
 if not GROQ_KEY or not WEBHOOK:
-    print("!!! ОШИБКА: Проверь секреты GROQ_API_KEY и DISCORD_WEBHOOK в GitHub !!!", flush=True)
+    print("!!! ОШИБКА: Проверь секреты в GitHub (GROQ_API_KEY, DISCORD_WEBHOOK) !!!", flush=True)
     sys.exit(1)
 
 client = Groq(api_key=GROQ_KEY)
@@ -48,101 +48,107 @@ class TracenScanner:
             print(f"--- Сканирование {self.region}... ---", flush=True)
             r = requests.get(self.url, headers=self.headers, timeout=25)
             r.raise_for_status()
+            r.encoding = 'utf-8' # Гарантируем правильное чтение японского
             soup = BeautifulSoup(r.text, 'html.parser')
             
             if "Japan" in self.region:
-                # МЕХАНИЗМ УСИЛЕННОГО ПОИСКА (JP)
-                item = soup.select_one('.news-list__item')
-                if not item:
-                    item = soup.find('a', href=re.compile(r'detail\.php\?id=\d+'))
-                if not item:
-                    item = soup.select_one('li[class*="news"]')
-
-                if not item: 
-                    print(f"DEBUG: На странице JP не найдены новости. Проверь структуру сайта.", flush=True)
-                    return None
+                # Продвинутый поиск JP новостей
+                item = soup.select_one('.news-list__item') or \
+                       soup.find('a', href=re.compile(r'/news/detail\.php\?id=\d+')) or \
+                       soup.select_one('li[class*="news"]')
+                
+                if not item: return None
                 
                 link_tag = item if item.name == 'a' else item.find('a')
                 if not link_tag: return None
                 
                 href = link_tag['href']
-                link = "https://umamusume.jp" + href if href.startswith('/') else href
+                full_link = "https://umamusume.jp" + href if href.startswith('/') else href
                 
-                # Извлекаем чистый цифровой ID
-                news_id_match = re.search(r'id=(\d+)', link)
-                news_id = news_id_match.group(1) if news_id_match else link.split('/')[-1]
+                # Извлекаем ID
+                id_match = re.search(r'id=(\d+)', full_link)
+                news_id = id_match.group(1) if id_match else full_link.split('/')[-1]
                 
-                img_tag = item.find('img') if hasattr(item, 'find') else None
-                img = img_tag['src'] if img_tag else None
+                img_tag = item.find('img')
+                img_url = img_tag['src'] if img_tag else None
                 
-                return {"id": str(news_id), "url": link, "img": img}
-            
+                return {"id": str(news_id), "url": full_link, "img": img_url}
             else:
-                # ПОИСК ДЛЯ GLOBAL (CRUNCHYROLL)
+                # Поиск EN новостей
                 links = soup.find_all('a', href=True)
                 for a in links:
-                    href = a['href'].lower()
-                    if "uma-musume" in href or "pretty-derby" in href:
+                    txt = a.get_text().lower()
+                    hrf = a['href'].lower()
+                    if "uma-musume" in hrf or "pretty-derby" in hrf:
                         l = a['href'] if a['href'].startswith('http') else "https://www.crunchyroll.com" + a['href']
-                        id_val = l.rstrip('/').split('/')[-1]
-                        return {"id": str(id_val), "url": l, "img": None}
+                        return {"id": str(l.split('/')[-1]), "url": l, "img": None}
                 return None
         except Exception as e:
             print(f"Ошибка сканера {self.region}: {e}", flush=True)
             return None
 
     def check_new(self, current_id: str) -> bool:
-        if not os.path.exists(self.db_file): 
-            with open(self.db_file, 'w') as f: f.write("EMPTY")
-            return True
+        if not os.path.exists(self.db_file): return True
         with open(self.db_file, 'r') as f:
-            old_id = f.read().strip()
-            print(f"Сравнение для {self.region}: Старый({old_id}) vs Новый({current_id})", flush=True)
-            return old_id != current_id
+            return f.read().strip() != current_id
 
     def save_id(self, current_id: str):
         with open(self.db_file, 'w') as f: f.write(str(current_id))
 
 class MultiRegionAI:
     @staticmethod
-    def analyze(text: str, region: str) -> Dict[str, Any]:
-        print(f"--- Отправка в ИИ ({region}) ---", flush=True)
+    def analyze(html_content: str, region: str) -> Dict[str, Any]:
+        print(f"--- ИИ анализирует {region} ---", flush=True)
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # Берем только тело новости, чтобы не тратить токены ИИ на меню сайта
+        main_body = soup.select_one('.p-news-detail__body') or \
+                    soup.select_one('.news-detail__body') or \
+                    soup.select_one('article')
+        
+        clean_text = main_body.get_text(separator=' ', strip=True) if main_body else soup.get_text()[:4000]
+
         prompt = f"""
         Ты — главный аналитик Tracen Intelligence. Сделай подробный разбор на русском.
         РЕГИОН: {region}
-        ЗАДАЧА:
-        1. Определи Ранг (S/A/B/C).
-        2. Это баннер или важный анонс? (True/False).
-        3. Сделай краткий и емкий разбор.
+        Заголовок статьи часто в начале текста.
+        
         ВЕРНИ СТРОГО JSON:
         {{
-            "rank": "...", "title": "...", "is_banner": bool,
-            "summary": "...", "details": "...", "future": "...", "verdict": "..."
+            "rank": "S/A/B/C", "title": "Заголовок на русском", "is_banner": bool,
+            "summary": "Краткая суть", "details": "Список ключевых изменений",
+            "future": "Прогноз для игроков", "verdict": "Совет: крутить или копить"
         }}
-        Текст новости: {text[:4500]}
+        Текст: {clean_text[:5000]}
         """
-        res = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"}
-        )
-        return json.loads(res.choices[0].message.content)
+        try:
+            res = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                response_format={"type": "json_object"}
+            )
+            return json.loads(res.choices[0].message.content)
+        except Exception as e:
+            print(f"Ошибка ИИ: {e}", flush=True)
+            return {
+                "rank": "B", "title": "Новое обновление", "is_banner": False,
+                "summary": "Не удалось провести анализ.", "details": "См. оригинал.",
+                "future": "N/A", "verdict": "Проверьте новость вручную."
+            }
 
 def process_region(region_name, url, db_file):
     scanner = TracenScanner(region_name, url, db_file)
     meta = scanner.get_latest()
     
     if meta and scanner.check_new(meta["id"]):
-        print(f"!!! ОБНАРУЖЕНА НОВАЯ АКТИВНОСТЬ: [{region_name}] ID {meta['id']} !!!", flush=True)
+        print(f"!!! НАЙДЕНА НОВОСТЬ: {region_name} (ID: {meta['id']}) !!!", flush=True)
         try:
-            # Очистка текста от HTML тегов для ИИ
             resp = requests.get(meta["url"], timeout=20)
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            clean_text = soup.get_text(separator=' ', strip=True)
+            resp.encoding = 'utf-8' # ФИКС КОДИРОВКИ
             
-            analysis = MultiRegionAI.analyze(clean_text, region_name)
+            analysis = MultiRegionAI.analyze(resp.text, region_name)
             
-            # Пинги
             ping = f"<@&{ROLE_NEWS}>"
             if analysis.get("is_banner") or analysis.get("rank") == "S":
                 ping += f" <@&{ROLE_BANNER}>"
@@ -152,17 +158,17 @@ def process_region(region_name, url, db_file):
             payload = {
                 "content": f"📢 **НОВЫЙ ОТЧЕТ: РЕГИОН {region_name.upper()}**\n{ping}",
                 "embeds": [{
-                    "title": f"— ✦ RANK: {analysis['rank']} | {analysis['title']} ✦ —",
+                    "title": f"— ✦ RANK: {analysis.get('rank', 'B')} | {analysis.get('title', 'Update')} ✦ —",
                     "description": (
-                        f"**{analysis['summary']}**\n\n"
+                        f"**{analysis.get('summary', '')}**\n\n"
                         f"╭─── ⭐ **АНАЛИЗ ({region_name})**\n"
-                        f"│ {analysis['details']}\n"
+                        f"│ {analysis.get('details', '')}\n"
                         "│\n"
                         f"│ ▸ **ПРЕДСКАЗАНИЕ / СЛИВЫ**\n"
-                        f"│ 🔮 {analysis['future']}\n"
+                        f"│ 🔮 {analysis.get('future', '')}\n"
                         "│\n"
                         f"│ ▸ **ВЕРДИКТ ТРЕНЕРА**\n"
-                        f"│ ✅ {analysis['verdict']}\n"
+                        f"│ ✅ {analysis.get('verdict', '')}\n"
                         f"╰─── 🔗 [ИСТОЧНИК]({meta['url']})"
                     ),
                     "color": color,
@@ -172,23 +178,17 @@ def process_region(region_name, url, db_file):
                 }]
             }
             
-            r = requests.post(WEBHOOK, json=payload)
-            if r.status_code < 300:
+            if requests.post(WEBHOOK, json=payload).status_code < 300:
                 scanner.save_id(meta["id"])
-                print(f"Отчет {region_name} успешно доставлен в Discord.", flush=True)
-            else:
-                print(f"Ошибка Discord Webhook: {r.status_code}", flush=True)
+                print(f"Успешно отправлено в Discord.", flush=True)
         except Exception as e:
-            print(f"Ошибка обработки {region_name}: {e}", flush=True)
+            print(f"Критическая ошибка обработки: {e}", flush=True)
     else:
-        print(f"Обновлений для {region_name} не найдено.", flush=True)
+        print(f"Обновлений для {region_name} нет.", flush=True)
 
 if __name__ == "__main__":
-    print("=== ЗАПУСК TRACEN INTELLIGENCE SYSTEM ===", flush=True)
-    # Обработка Японии
+    print("=== STARTING TRACEN INTELLIGENCE ===", flush=True)
     process_region("Japan", JP_URL, DB_JP)
-    print("--- Ожидание перед сменой региона... ---", flush=True)
-    time.sleep(7)
-    # Обработка Глобала
+    time.sleep(5)
     process_region("Global", GLOBAL_URL, DB_GL)
-    print("=== ЦИКЛ МОНИТОРИНГА ЗАВЕРШЕН ===", flush=True)
+    print("=== WORK FINISHED ===", flush=True)
