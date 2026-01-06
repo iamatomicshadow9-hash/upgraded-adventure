@@ -2,7 +2,7 @@
 name: Uma Divine Tracker
 on:
   schedule:
-    - cron: '*/10 * * * *' # Проверка каждые 10 минут
+    - cron: '*/10 * * * *'
   workflow_dispatch:
 permissions:
   contents: write
@@ -14,7 +14,7 @@ jobs:
       - uses: actions/setup-python@v4
         with:
           python-version: '3.10'
-      - run: pip install -r requirements.txt
+      - run: pip install requests beautifulsoup4 groq
       - env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
